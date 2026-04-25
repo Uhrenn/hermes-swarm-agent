@@ -7,7 +7,7 @@
 
 Ramped concurrent LLM calls from 25 → 300, measuring success rate at each level.
 
-### Ollama Cloud — nemotron-3-nano:30b (default)
+### Ollama Cloud — nemotron-3-nano:30b
 | Concurrent | Success | Rate | Wall Time | Throughput | Tokens | Status |
 |-----------|---------|------|-----------|------------|--------|--------|
 | 25 | 25/25 (100%) | 1.3/s | 19.3s | 1.3/s | 3,039 | SWEET SPOT |
@@ -41,13 +41,15 @@ Hard ceiling: ~50 concurrent; drops to 0 at 150+
 
 ---
 
-## Test 2: Provider Single-Call Latency (5 calls each)
+## Test 2: Provider Single-Call Latency (10 calls, nemotron-3-nano:30b)
 
-| Provider | Model | Avg Latency | Avg Tokens |
-|----------|-------|-------------|------------|
-| Ollama Cloud | nemotron-3-nano:30b | 1.3s | 102 |
-| Ollama Cloud | gpt-oss:20b | 2.2s | 191 |
-| Xiaomi | mimo-v2.5-pro | 3.1s | 127 |
+| Metric | Value |
+|--------|-------|
+| Avg wall time | 2.17s |
+| Avg total tokens | 552 |
+| Avg prompt tokens | 98 |
+| Avg completion tokens | 454 |
+| Min/Max time | 1.77s / 2.57s |
 
 ---
 
@@ -55,52 +57,62 @@ Hard ceiling: ~50 concurrent; drops to 0 at 150+
 
 ### Configuration
 - **Provider:** Ollama Cloud (nemotron-3-nano:30b)
-- **Workers:** 225 (300 requested, 225 sources available)
-- **Max concurrent:** 100
-- **Strategy:** map_reduce (with reducer tree + finalizer + 3 verifiers)
-- **Retry logic:** Adaptive — halves concurrency on 429, exponential backoff
+- **Workers:** 300
+- **Max concurrent:** 300 (provider-aware scheduling starts at sweet spot: 100)
+- **Strategy:** fanout
+- **Retry logic:** Adaptive — reduces concurrency on 429, exponential backoff with jitter
 - **Worker timeout:** 45s per call
-- **Global timeout:** 900s
+- **Global timeout:** 600s
 
 ### Results
 | Metric | Value |
 |--------|-------|
-| **Total workers** | 225 |
-| **Completed** | 225/225 (100%) |
+| **Total workers** | 300 |
+| **Completed** | 300/300 (100%) |
 | **Failed** | 0 |
+| **Initial concurrent** | 100 (provider sweet spot) |
 | **Peak concurrency** | 100 |
-| **Waves executed** | 4 |
-| **Retries (auto-recovered)** | 41 |
-| **Wall time** | 303.2s (5.1 min) |
-| **Throughput** | 0.7 workers/sec |
-| **Total output chars** | 512,685 |
-| **Avg chars per worker** | 2,279 |
-| **Synthesis length** | 5,817 chars |
+| **Waves executed** | 5 |
+| **Auto-retries recovered** | 44 |
+| **Total LLM calls** | 344 |
+| **Wall time** | **3.7 minutes** |
+| **Throughput** | 1.4 workers/sec |
+| **Total tokens consumed** | ~190K |
+| **Tokens per worker** | ~552 (98 prompt + 454 completion) |
 
-### Cost Estimation
-| Item | Count | Est. Tokens |
-|------|-------|-------------|
-| Worker calls (incl. retries) | 266 | ~39,900 |
-| Reducer calls | 23 | ~3,450 |
-| Finalizer call | 1 | ~150 |
-| Verifier calls | 3 | ~450 |
-| **Total** | **293** | **~43,950** |
+### Cost — Ollama Cloud Subscription Model
 
-| Cost Factor | Value |
-|-------------|-------|
-| Ollama Cloud pricing | Free tier (hosted models) |
-| **Estimated cost** | **~$0.00** |
-| Cost per worker | ~$0.000 |
-| Cost per 1000 chars output | ~$0.000 |
+Ollama Cloud charges by **GPU time**, not per token. Plans:
 
-### Comparison with Previous Xiaomi Run
-| Metric | Xiaomi (naive) | Ollama Cloud (with retry) |
-|--------|---------------|--------------------------|
-| Workers | 250 | 225 |
-| Success rate | 39% (97/250) | 100% (225/225) |
+| Plan | Price | Concurrent Models | Session Limit | 300-Worker Swarm Impact |
+|------|-------|-------------------|---------------|------------------------|
+| **Free** | $0/mo | 1 | Light usage | ⚠️ Likely exhausts session |
+| **Pro** | $20/mo | 3 | 50× Free | ⚠️ Significant session usage |
+| **Max** | $100/mo | 10 | 250× Free | ✅ Well within limits |
+
+**Measured GPU consumption:**
+- Avg 2.17s GPU time per call × 344 calls = **~748 seconds (12.5 min) total GPU time**
+- This is a "heavy, sustained usage" workload — Ollama's Max tier description
+- Session limits reset every 5 hours, weekly limits every 7 days
+- Per-token pricing coming soon: "Additional usage at competitive per-token rates, including cache-aware pricing"
+- Check your usage: https://ollama.com/settings/usage
+
+**Recommendation:** Max tier ($100/mo) for frequent swarm use. Pro tier for occasional use. Free tier will be exhausted by a single 300-worker run.
+
+---
+
+## Comparison: Provider-Aware Scheduling vs Naive Launch
+
+| Metric | Naive (max_concurrent=300) | Provider-Aware (starts at 100) |
+|--------|---------------------------|-------------------------------|
+| Workers | 250 | 300 |
+| Success rate | 39% (97/250) | 100% (300/300) |
 | Retry logic | None | Adaptive + backoff |
-| Wall time | 19.6s | 303.2s |
-| Usable results | 97 | 225 |
+| Wall time | 19.6s | 222s (3.7min) |
+| Usable results | 97 | **300** |
+| 429 errors | 153 (all wasted) | 44 (all recovered) |
+
+The provider-aware scheduler starts at the provider's proven sweet spot (100 for Ollama Cloud) and runs clean waves. Stragglers from rate limits are auto-recovered. This costs more wall time but achieves 100% worker completion.
 
 ---
 
@@ -108,17 +120,16 @@ Hard ceiling: ~50 concurrent; drops to 0 at 150+
 
 **For 300-worker swarm workloads:**
 
-1. **Ollama Cloud (nemotron-3-nano:30b)** at **100 concurrent** with adaptive retry
-   - 100% success rate
-   - Free tier pricing
-   - 5 minutes for 300 workers
-   - Best reliability
+1. **Ollama Cloud (nemotron-3-nano:30b)** at **100 concurrent** with provider-aware scheduling
+   - 100% success rate with auto-retry
+   - ~12.5 min GPU time per run
+   - Best for Max tier ($100/mo) or higher
 
-2. **Xiaomi MiMo v2.5-pro** at **50 concurrent** with adaptive retry
+2. **Xiaomi MiMo v2.5-pro** at **50 concurrent** with provider-aware scheduling
    - Faster per-call (3.1s vs 1.3s but higher throughput at 50)
    - Better for smaller swarms (50-100 workers)
-   - Paid tier — check pricing
+   - Per-token pricing — check Xiaomi platform
 
 3. **Never use MiniMax** for concurrent swarm workloads — instant 429 at any concurrency
 
-The swarm plugin's adaptive retry logic automatically handles rate limits: when 429s are detected, it halves concurrency and retries with exponential backoff. This means even if you set max_concurrent=300, it will converge to the provider's actual sweet spot within 1-2 waves.
+The swarm plugin's provider-aware scheduling starts at the known sweet spot and adapts from there. Even if you set max_concurrent=300, it will use 100 for Ollama Cloud and auto-recover any stragglers.

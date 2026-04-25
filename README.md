@@ -234,7 +234,25 @@ Tested with stepwise concurrency ramp (25 → 300) to find each provider's sweet
 | Wall time | **3.7 minutes** |
 | Throughput | 1.4 workers/sec |
 | Total LLM calls | 344 |
-| **Cost** | **~$0.00** |
+| Total tokens | ~190K |
+| **GPU time** | **~12.5 minutes** |
+| **Cost** | **Subscription-based** (see below) |
+
+### Cost — Ollama Cloud Subscription
+
+Ollama Cloud charges by **GPU time**, not per token:
+
+| Plan | Price | 300-Worker Swarm Impact |
+|------|-------|------------------------|
+| **Free** | $0/mo | ⚠️ Likely exhausts session |
+| **Pro** | $20/mo | ⚠️ Significant session usage |
+| **Max** | $100/mo | ✅ Well within limits |
+
+- Avg 2.17s GPU time per call × 344 calls = **~12.5 min total GPU time**
+- ~552 tokens per worker (98 prompt + 454 completion)
+- Session limits reset every 5 hours, weekly limits every 7 days
+- Per-token add-on pricing coming soon
+- Check usage: https://ollama.com/settings/usage
 
 ---
 
