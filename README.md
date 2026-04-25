@@ -59,7 +59,40 @@ rm -rf ~/.hermes/plugins/swarm-agent
 
 ## Usage
 
-### Basic Research Task
+### Slash Command: `/swarm`
+
+Users can trigger the swarm directly:
+
+```
+/swarm Evaluate the top 10 AI agent frameworks in 2026
+```
+
+With options:
+
+```
+/swarm provider:ollama-cloud workers:100 concurrent:50 Audit all Python files for security
+/swarm workers:300 concurrent:100 strategy:fanout Research 300 competitors
+/swarm verifiers:3 timeout:600 provider:ollama-cloud Do a deep analysis of this codebase
+/swarm dry_run What sources would you analyze for market research?
+/swarm help
+```
+
+Options are `key:value` pairs before the goal text:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `provider:<name>` | LLM provider | auto |
+| `model:<name>` | Model override | auto |
+| `workers:<N>` | Total workers | 50 |
+| `concurrent:<N>` | Max concurrent | 50 |
+| `strategy:<type>` | `map_reduce` or `fanout` | `map_reduce` |
+| `verifiers:<N>` | Verifier count | 0 |
+| `timeout:<N>` | Global timeout (seconds) | 900 |
+| `dry_run` | Plan only, don't execute | false |
+
+### Tool: `swarm_task`
+
+The agent can also call `swarm_task` as a tool when it decides parallel research would help.
 
 ```json
 {
