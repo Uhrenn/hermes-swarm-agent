@@ -1,0 +1,7 @@
+name: swarm-agent
+version: 0.1.0
+description: "Uninstallable Hermes plugin that adds a bounded swarm_task tool for planner-free map/reduce style subagent waves."
+author: "Hermes Agent"
+kind: standalone
+provides_tools:
+  - swarm_task
