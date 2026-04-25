@@ -1,8 +1,7 @@
 """Uninstallable swarm-agent plugin for Hermes Agent.
 
-The plugin registers:
-- Tool: ``swarm_task`` under the ``swarm`` toolset (for agent-initiated calls)
-- Slash command: ``/swarm`` (for user-initiated calls)
+The plugin registers ONLY a slash command: ``/swarm``
+Users trigger it manually — the agent cannot call it on its own.
 
 Install location: ``~/.hermes/plugins/swarm-agent``
 Uninstall: ``hermes plugins disable swarm-agent && hermes plugins remove swarm-agent``
@@ -13,7 +12,7 @@ from __future__ import annotations
 import json
 
 try:
-    from .tools import SWARM_TASK_SCHEMA, swarm_task
+    from .tools import swarm_task
 except ImportError:  # Allows direct file import from plugin loaders/tests.
     import importlib.util
     from pathlib import Path
@@ -24,7 +23,6 @@ except ImportError:  # Allows direct file import from plugin loaders/tests.
         raise
     _tools = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_tools)
-    SWARM_TASK_SCHEMA = _tools.SWARM_TASK_SCHEMA
     swarm_task = _tools.swarm_task
 
 
@@ -50,7 +48,7 @@ def _parse_swarm_args(raw_args: str) -> dict:
         return {
             "help": True,
             "text": (
-                "🐝 /swarm — Run a parallel LLM research swarm\n\n"
+                "\U0001f41d /swarm \u2014 Run a parallel LLM research swarm\n\n"
                 "Usage: /swarm [options] <your research goal>\n\n"
                 "Options (key:value, before the goal):\n"
                 "  provider:<name>    LLM provider (ollama-cloud, xiaomi, etc.)\n"
@@ -85,17 +83,15 @@ def _parse_swarm_args(raw_args: str) -> dict:
                 try:
                     params[key] = int(val)
                 except ValueError:
-                    # Not a valid number — treat as part of goal
                     goal_start = i
                     break
-            elif key == "worker" or key == "conc":
+            elif key in ("worker", "conc"):
                 try:
                     params["workers" if key == "worker" else "concurrent"] = int(val)
                 except ValueError:
                     goal_start = i
                     break
             else:
-                # Unknown key — treat rest as goal
                 goal_start = i
                 break
             goal_start = i + 1
@@ -103,7 +99,6 @@ def _parse_swarm_args(raw_args: str) -> dict:
             params["dry_run"] = True
             goal_start = i + 1
         else:
-            # First non-key:value word — everything from here is the goal
             goal_start = i
             break
 
@@ -144,7 +139,7 @@ def _handle_swarm_command(raw_args: str) -> str:
     if result.get("dry_run"):
         plan = result.get("plan", {})
         lines = [
-            "🐝 **Swarm Dry Run**",
+            "\U0001f41d **Swarm Dry Run**",
             f"Strategy: {plan.get('strategy')}",
             f"Workers: {plan.get('total_workers')}",
             f"Max concurrent: {plan.get('max_concurrent')}",
@@ -164,7 +159,7 @@ def _handle_swarm_command(raw_args: str) -> str:
     duration = result.get("total_duration_seconds", 0)
 
     lines = [
-        f"🐝 **Swarm Complete** — {workers} workers in {duration:.0f}s",
+        f"\U0001f41d **Swarm Complete** \u2014 {workers} workers in {duration:.0f}s",
         f"Completed: {obs.get('completed', 0)} | Failed: {obs.get('failed', 0)} | "
         f"Waves: {obs.get('waves', 0)} | Retries: {obs.get('total_retries', 0)}",
         "",
@@ -173,7 +168,7 @@ def _handle_swarm_command(raw_args: str) -> str:
     if synthesis:
         lines.append(synthesis)
     else:
-        # fanout mode — show preview of worker results
+        # fanout mode \u2014 show preview of worker results
         lines.append("**Worker Results:**")
         for wr in result.get("worker_results_preview", [])[:10]:
             status = wr.get("status", "?")
@@ -185,34 +180,11 @@ def _handle_swarm_command(raw_args: str) -> str:
 
 
 def register(ctx) -> None:
-    """Register swarm tool and /swarm slash command with Hermes."""
+    """Register /swarm slash command with Hermes.
 
-    # Tool — used by the agent when it decides to call swarm_task
-    ctx.register_tool(
-        name="swarm_task",
-        toolset="swarm",
-        schema=SWARM_TASK_SCHEMA,
-        handler=lambda args, **kw: swarm_task(
-            goal=args.get("goal"),
-            context=args.get("context"),
-            sources=args.get("sources"),
-            mode=args.get("mode", "llm_only"),
-            strategy=args.get("strategy", "map_reduce"),
-            max_workers=args.get("max_workers", 25),
-            max_concurrent=args.get("max_concurrent", 25),
-            verifier_count=args.get("verifier_count", 0),
-            timeout_seconds=args.get("timeout_seconds", 900),
-            worker_timeout_seconds=args.get("worker_timeout_seconds", 180),
-            provider=args.get("provider"),
-            model=args.get("model"),
-            allow_300_live=args.get("allow_300_live", False),
-            dry_run=args.get("dry_run", False),
-            parent_agent=kw.get("parent_agent"),
-        ),
-        emoji="🐝",
-    )
-
-    # Slash command — /swarm, user-initiated
+    NO tool is registered \u2014 the agent cannot call swarm_task on its own.
+    Only the user can trigger it via /swarm.
+    """
     ctx.register_command(
         name="swarm",
         handler=_handle_swarm_command,

@@ -19,12 +19,13 @@ def _load_module(filename: str, module_name: str):
     return module
 
 
-def test_manifest_declares_swarm_task_tool():
+def test_manifest_declares_swarm_command():
     manifest = (PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8")
 
     assert "name: swarm-agent" in manifest
     assert "kind: standalone" in manifest
-    assert "swarm_task" in manifest
+    assert "swarm" in manifest
+    assert "provides_commands" in manifest
 
 
 def test_swarm_task_schema_has_delegate_free_300_defaults():

@@ -1,7 +1,7 @@
 name: swarm-agent
-version: 0.1.0
-description: "Uninstallable Hermes plugin that adds a bounded swarm_task tool for planner-free map/reduce style subagent waves."
+version: 0.2.0
+description: "User-controlled swarm plugin — adds /swarm slash command for parallel LLM research (up to 300 workers). Agent cannot call it on its own."
 author: "Hermes Agent"
 kind: standalone
-provides_tools:
-  - swarm_task
+provides_commands:
+  - swarm

@@ -1,8 +1,8 @@
 # 🐝 hermes-swarm-agent
 
-**Uninstallable swarm plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — run up to 300 lightweight LLM workers concurrently with adaptive retry, provider benchmarking, and map/reduce synthesis.**
+**Uninstallable swarm plugin for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — run up to 300 lightweight LLM workers concurrently via the `/swarm` slash command.**
 
-> This plugin does **not** use or modify Hermes' built-in `delegate_task`. Both can coexist.
+> User-controlled only — the agent cannot call this on its own. Only `/swarm` triggers it.
 
 ---
 
@@ -20,8 +20,9 @@ User objective
 
 ### Why Not `delegate_task`?
 
-| Feature | `delegate_task` (Hermes core) | `swarm_task` (this plugin) |
-|---------|-------------------------------|---------------------------|
+| Feature | `delegate_task` (Hermes core) | `/swarm` (this plugin) |
+|---------|-------------------------------|------------------------|
+| Who triggers | Agent decides | **User via `/swarm`** |
 | Worker type | Full `AIAgent` instances with tools | Lightweight LLM-only coroutines |
 | Tool access | Full tool loop (file, terminal, browser) | No tools (LLM calls only) |
 | Max practical concurrency | 3–10 | **100–300** |
@@ -92,7 +93,7 @@ Options are `key:value` pairs before the goal text:
 
 ### Tool: `swarm_task`
 
-The agent can also call `swarm_task` as a tool when it decides parallel research would help.
+The agent **cannot** call `swarm_task` on its own — it's only available internally to the `/swarm` command handler. Only users decide when to use the swarm.
 
 ```json
 {
