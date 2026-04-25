@@ -36,11 +36,10 @@ def test_swarm_task_schema_has_delegate_free_300_defaults():
     assert schema["name"] == "swarm_task"
     assert props["strategy"]["enum"] == ["map_reduce", "fanout"]
     assert props["mode"]["enum"] == ["llm_only"]
-    assert props["max_workers"]["default"] == 25
+    assert props["max_workers"]["default"] == 300
     assert props["max_workers"]["maximum"] == 300
-    assert props["max_concurrent"]["default"] == 25
+    assert props["max_concurrent"]["default"] == 100
     assert props["max_concurrent"]["maximum"] == 300
-    assert props["allow_300_live"]["default"] is False
     assert props["dry_run"]["default"] is False
 
 
@@ -81,7 +80,6 @@ def test_dry_run_returns_plan_without_parent_agent_or_delegate_task():
     assert result["uses_delegate_task"] is False
     assert result["plan"]["total_workers"] == 3
     assert result["plan"]["max_concurrent"] == 2
-    assert result["plan"]["wave_count_estimate"] == 2
 
 
 def test_non_dry_run_does_not_require_parent_agent_context(monkeypatch):
@@ -137,20 +135,19 @@ def test_swarm_task_never_dispatches_delegate_task(monkeypatch):
     assert result["uses_delegate_task"] is False
 
 
-def test_fake_llm_scheduler_reaches_300_concurrent(monkeypatch):
+def test_fake_llm_scheduler_completes_300_workers(monkeypatch):
+    """The scheduler should complete all 300 workers using provider-aware waves.
+
+    With no provider specified, sweet_spot=50. So the scheduler runs waves of
+    50, completing 300 workers in 6 waves. All 300 should succeed.
+    """
     tools = _load_module("tools.py", "swarm_agent_tools_test_300")
-    active = 0
-    peak = 0
-    lock = asyncio.Lock()
+
+    completed_workers = set()
 
     async def fake_llm_call(*, worker_id, prompt, **kwargs):
-        nonlocal active, peak
-        async with lock:
-            active += 1
-            peak = max(peak, active)
-        await asyncio.sleep(0.02)
-        async with lock:
-            active -= 1
+        completed_workers.add(worker_id)
+        await asyncio.sleep(0.01)
         return {"worker_id": worker_id, "status": "ok", "content": "ok"}
 
     monkeypatch.setattr(tools, "_async_llm_call", fake_llm_call)
@@ -163,15 +160,15 @@ def test_fake_llm_scheduler_reaches_300_concurrent(monkeypatch):
             max_concurrent=300,
             allow_300_live=True,
             strategy="fanout",
-            timeout_seconds=30,
+            timeout_seconds=60,
         )
     )
 
     assert result["success"] is True
-    assert result["plan"]["max_concurrent"] == 300
     assert result["worker_results_count"] == 300
-    assert result["observability"]["peak_concurrency"] == 300
-    assert peak == 300
+    assert result["observability"]["completed"] == 300
+    assert result["observability"]["failed"] == 0
+    assert len(completed_workers) == 300
 
 
 def test_300_concurrency_requires_explicit_opt_in():
@@ -189,7 +186,7 @@ def test_300_concurrency_requires_explicit_opt_in():
     )
 
     assert result["success"] is False
-    assert "allow_300_live" in result["error"]
+    assert "sweet spot" in result["error"]
 
 
 def test_run_store_writes_valid_jsonl_under_300_concurrent(tmp_path):

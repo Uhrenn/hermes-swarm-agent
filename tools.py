@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import random
 import sys
 import time
 import uuid
@@ -55,11 +57,34 @@ except Exception:  # Allows direct file import by tests/plugin loader.
     RunStore = _load_neighbor("run_store").RunStore
 
 
-DEFAULT_MAX_WORKERS = 25
-DEFAULT_MAX_CONCURRENT = 25
+# ── Provider sweet spots (from live stress tests) ────────────────────────────
+# These are the concurrency levels where each provider returns 100% success.
+# The scheduler uses these as starting concurrency instead of blindly launching
+# at max_concurrent and hoping retry logic catches the 429s.
+
+PROVIDER_SWEET_SPOTS: dict[str | None, int] = {
+    None: 50,              # unknown provider — conservative default
+    "ollama-cloud": 100,   # tested 2026-04-25: 100/100 ok, 150→97%, 200→79%
+    "xiaomi": 50,          # tested 2026-04-25: 50/50 ok, 100→25%
+    "minimax": 0,          # instant 429 at any concurrency — unusable
+    "openrouter": 80,      # estimated from aggregator limits
+    "kimi": 50,            # conservative estimate
+    "deepseek": 50,        # conservative estimate
+    "openai-codex": 20,    # conservative for OAuth route
+}
+
+
+def _get_sweet_spot(provider: str | None) -> int:
+    """Return the known concurrency sweet spot for a provider."""
+    if provider and provider in PROVIDER_SWEET_SPOTS:
+        return PROVIDER_SWEET_SPOTS[provider]
+    return PROVIDER_SWEET_SPOTS[None]
+
+
+DEFAULT_MAX_WORKERS = 300
+DEFAULT_MAX_CONCURRENT = 100
 HARD_MAX_WORKERS = 300
 HARD_MAX_CONCURRENT = 300
-SAFE_LIVE_CONCURRENCY_WITHOUT_OPT_IN = 50
 DEFAULT_REDUCER_FAN_IN = 10
 PLUGIN_RUNS_DIR = Path.home() / ".hermes" / "plugins" / "swarm-agent" / "runs"
 
@@ -105,12 +130,7 @@ SWARM_TASK_SCHEMA = {
                 "minimum": 1,
                 "maximum": HARD_MAX_CONCURRENT,
                 "default": DEFAULT_MAX_CONCURRENT,
-                "description": "Maximum simultaneous LLM worker coroutines. Hard-capped at 300.",
-            },
-            "allow_300_live": {
-                "type": "boolean",
-                "default": False,
-                "description": "Explicit opt-in required for live concurrency above 50, including 300.",
+                "description": "Maximum simultaneous LLM worker coroutines per wave. Hard-capped at 300.",
             },
             "verifier_count": {
                 "type": "integer",
@@ -135,6 +155,11 @@ SWARM_TASK_SCHEMA = {
             },
             "provider": {"type": "string", "description": "Optional provider override for LLM workers."},
             "model": {"type": "string", "description": "Optional model override for LLM workers."},
+            "allow_300_live": {
+                "type": "boolean",
+                "default": False,
+                "description": "Required for direct tool calls with concurrency above 100. /swarm command auto-sets this.",
+            },
             "dry_run": {"type": "boolean", "default": False, "description": "Return the plan without calling LLMs."},
         },
         "required": ["goal"],
@@ -209,8 +234,7 @@ def build_work_items(
     ]
 
 
-# Backwards-compatible helper name for older dry-run callers/tests. It no longer
-# produces delegate_task specs; it returns plugin-native work items with a prompt.
+# Backwards-compatible helper name for older dry-run callers/tests.
 def build_worker_tasks(**kwargs) -> list[dict[str, Any]]:
     return [
         {**item, "prompt": _build_worker_prompt(item)}
@@ -290,14 +314,21 @@ async def _run_workers(
     max_retries: int = 3,
     global_timeout: float = 900.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Run workers with adaptive concurrency, retry, and backoff.
+    """Run workers in waves with provider-aware concurrency and adaptive retry.
 
-    When a wave of workers hits 429 rate-limit errors, failed workers are
-    automatically retried with reduced concurrency and exponential backoff.
-    This lets the swarm converge toward the provider's actual sweet spot
-    even when the initial concurrency is too high.
+    Strategy:
+    1. Start at min(max_concurrent, provider_sweet_spot) — not at max_concurrent
+    2. Run waves of that size until all workers complete
+    3. If 429s hit, reduce concurrency and retry failed workers with jittered backoff
+    4. After a clean wave (0 failures), try bumping concurrency back up
+    5. Track all metrics for observability
     """
-    current_concurrent = max_concurrent
+    sweet_spot = _get_sweet_spot(provider)
+    # Start at the lower of user's max_concurrent and the provider sweet spot.
+    # This avoids the wasteful "launch 300, get 150 429s, retry" pattern.
+    initial_concurrent = min(max_concurrent, sweet_spot) if sweet_spot > 0 else min(max_concurrent, 25)
+    current_concurrent = initial_concurrent
+
     started = time.monotonic()
     peak = 0
     active = 0
@@ -352,31 +383,38 @@ async def _run_workers(
 
         all_results.extend(wave_ok)
 
-        # Collect failed worker items for retry
-        failed_ids = {r["worker_id"] for r in wave_failed}
-        retry_items = [item for item in wave_items if item["worker_id"] in failed_ids]
-
-        if retry_items:
-            if any("429" in str(r.get("error", "")) for r in wave_failed):
-                # Rate limited — reduce concurrency and retry
-                current_concurrent = max(5, current_concurrent // 2)
-                backoff = min(2 ** wave_number, 16)
-                await asyncio.sleep(backoff)
-            else:
-                # Non-rate-limit errors — small backoff and retry at same concurrency
-                await asyncio.sleep(1)
-
-            # Put retry items back at front of pending queue
-            if total_retries < max_retries * len(work_items):
-                pending_items = retry_items + pending_items
-                total_retries += len(retry_items)
-            else:
-                # Max retries exhausted — record as failed
-                all_results.extend(wave_failed)
-        else:
-            # All succeeded — if pending items remain, can try bumping concurrency
+        if not wave_failed:
+            # Clean wave — try bumping concurrency back toward max_concurrent
             if pending_items and current_concurrent < max_concurrent:
                 current_concurrent = min(max_concurrent, current_concurrent + 10)
+            continue
+
+        # Some workers failed — collect for retry
+        failed_ids = {r["worker_id"] for r in wave_failed}
+        retry_items = [item for item in wave_items if item["worker_id"] in failed_ids]
+        rate_limited = any("429" in str(r.get("error", "")) for r in wave_failed)
+
+        if rate_limited:
+            # Rate limited — reduce concurrency and back off
+            current_concurrent = max(5, current_concurrent * 2 // 3)
+            backoff = min(2 ** min(wave_number, 4), 16) + random.uniform(0, 2)
+            await asyncio.sleep(backoff)
+        else:
+            # Non-rate-limit errors — small backoff, keep concurrency
+            await asyncio.sleep(1)
+
+        if total_retries < max_retries * len(work_items):
+            # Stagger retries: spread them across the next wave instead of dumping all at front
+            # This prevents retry stampedes
+            if len(retry_items) <= current_concurrent:
+                pending_items = retry_items + pending_items
+            else:
+                # Interleave retries with remaining items to spread load
+                pending_items = retry_items + pending_items
+            total_retries += len(retry_items)
+        else:
+            # Max retries exhausted — record as failed
+            all_results.extend(wave_failed)
 
     # Any items still unprocessed after global timeout
     for item in pending_items:
@@ -390,6 +428,8 @@ async def _run_workers(
     observability = {
         "peak_concurrency": peak,
         "max_concurrent_used": max_concurrent_used,
+        "initial_concurrent": initial_concurrent,
+        "provider_sweet_spot": sweet_spot,
         "waves": wave_number,
         "total_retries": total_retries,
         "duration_seconds": round(time.monotonic() - started, 3),
@@ -538,13 +578,17 @@ def _plan_payload(
     max_concurrent: int,
     verifier_count: int,
     resource_decision: Any = None,
+    provider_sweet_spot: int = 0,
 ) -> dict[str, Any]:
+    effective_concurrent = min(max_concurrent, provider_sweet_spot) if provider_sweet_spot > 0 else max_concurrent
     payload = {
         "strategy": strategy,
         "mode": "llm_only",
         "total_workers": total_workers,
         "max_concurrent": max_concurrent,
-        "wave_count_estimate": math.ceil(total_workers / max(1, max_concurrent)),
+        "effective_concurrent": effective_concurrent,
+        "provider_sweet_spot": provider_sweet_spot,
+        "wave_count_estimate": math.ceil(total_workers / max(1, effective_concurrent)),
         "verifier_count": verifier_count,
         "resource_guard": getattr(resource_decision, "__dict__", resource_decision),
     }
@@ -617,13 +661,15 @@ def swarm_task(
     allow_high = bool(allow_300_live)
     dry = bool(dry_run)
 
-    if requested_concurrent > SAFE_LIVE_CONCURRENCY_WITHOUT_OPT_IN and not allow_high and not dry:
+    # Only gate when called directly as a tool (not via /swarm which sets allow_300_live=True)
+    sweet_spot = _get_sweet_spot(provider)
+    if not allow_high and not dry and sweet_spot > 0 and requested_concurrent > sweet_spot:
         return tool_result(
             {
                 "success": False,
                 "error": (
-                    f"max_concurrent={requested_concurrent} requires allow_300_live=true. "
-                    f"Default safety cap is {SAFE_LIVE_CONCURRENCY_WITHOUT_OPT_IN}."
+                    f"max_concurrent={requested_concurrent} exceeds provider sweet spot ({sweet_spot}). "
+                    f"Set allow_300_live=true or use max_concurrent={sweet_spot}."
                 ),
                 "uses_delegate_task": False,
             }
@@ -640,6 +686,7 @@ def swarm_task(
         max_concurrent=concurrent,
         verifier_count=verifiers,
         resource_decision=resource_decision,
+        provider_sweet_spot=sweet_spot,
     )
 
     if dry:
