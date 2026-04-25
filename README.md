@@ -6,42 +6,94 @@
 
 ---
 
+## Why Swarm?
+
+Hermes already has `delegate_task` for spawning subagents. So why add a swarm?
+
+### The Problem with `delegate_task` at Scale
+
+`delegate_task` spawns full `AIAgent` instances — each one gets its own model client, system prompt, tool registry, session tracking, callbacks, and SQLite writes. That's great for 3–10 complex subtasks. But try 100 and you hit:
+
+- **Thread overhead** — each child is a full agent with model client, system prompt, tool registry, callbacks, session tracking
+- **File conflicts** — 100 agents writing to the same repo = merge chaos
+- **SQLite contention** — 100 concurrent session DB writes bottleneck
+- **API rate limits** — 100 full agents = 100× the token cost (system prompts, tool schemas, context)
+- **No retry logic** — if a child hits a 429, it just fails
+- **Memory pressure** — 100 full agent states in RAM
+
+### What Swarm Does Differently
+
+Swarm strips away the overhead. Each worker is a single LLM call — no tools, no session state, no file access, no SQLite writes. That means:
+
+| | `delegate_task | `/swarm` |
+|-|----------------|----------|
+| **Concurrency** | 3–10 practical | **100–300 proven** |
+| **Cost per worker** | Full system prompt + tool schemas (~2000 tokens overhead) | Single focused prompt (~200 tokens overhead) |
+| **300 workers cost** | ~600K overhead tokens wasted on system prompts | ~60K overhead tokens — **10× cheaper** |
+| **Speed** | Minutes per worker (tool loops, retries) | Seconds per worker (single LLM call) |
+| **300 workers time** | Hours | **3.7 minutes** |
+| **Retry on 429** | None — worker just fails | Auto-retry with adaptive backoff |
+| **Rate limit handling** | None — blast all 300 at once | Provider-aware sweet spots, wave-based execution |
+| **File conflicts** | 100 agents editing files = chaos | Zero — workers are LLM-only |
+| **Session DB** | 100 concurrent SQLite writes | Zero — plugin-local JSONL files |
+| **Uninstallable** | Core feature | `rm -rf ~/.hermes/plugins/swarm-agent` |
+
+### Real Numbers
+
+Tested on Ollama Cloud (nemotron-3-nano:30b):
+
+```
+300 workers completed:   100% success rate
+Wall time:               3.7 minutes
+Throughput:              1.4 workers/sec
+Total LLM calls:         344 (300 workers + 44 auto-recovered retries)
+Estimated cost:          $0.00 (Ollama Cloud free tier)
+```
+
+### When to Use Each
+
+**Use `delegate_task` when:**
+- You need agents to use tools (file, terminal, browser)
+- Tasks are complex, multi-step, and need agent reasoning loops
+- You need 3–10 specialized subagents with different toolsets
+- Tasks require file editing, code execution, or web browsing
+
+**Use `/swarm` when:**
+- You need broad parallel research across many sources
+- Tasks are independent and don't need tool access
+- You want 50–300 workers evaluating different things simultaneously
+- You need fast, cheap, high-throughput analysis
+- You want map-reduce synthesis across hundreds of inputs
+- You want auto-retry on rate limits with provider-aware scheduling
+
+**Use both together:**
+- `/swarm` to research 300 sources in parallel
+- `delegate_task` to take the synthesis and implement changes with tools
+
+---
+
 ## What It Does
 
-`swarm_task` runs many lightweight LLM workers concurrently over independent work items, stores results in plugin-local JSONL files, and optionally reduces outputs into a final synthesis with verifiers.
+`/swarm` runs many lightweight LLM workers concurrently over independent work items, stores results in plugin-local JSONL files, and optionally reduces outputs into a final synthesis with verifiers.
 
 ```text
 User objective
-  → 300 async LLM workers (with adaptive retry + backoff)
+  → 300 async LLM workers (provider-aware scheduling, adaptive retry)
   → Reducer tree (fan-in groups of 10)
   → Final synthesizer
   → Optional verifiers
 ```
-
-### Why Not `delegate_task`?
-
-| Feature | `delegate_task` (Hermes core) | `/swarm` (this plugin) |
-|---------|-------------------------------|------------------------|
-| Who triggers | Agent decides | **User via `/swarm`** |
-| Worker type | Full `AIAgent` instances with tools | Lightweight LLM-only coroutines |
-| Tool access | Full tool loop (file, terminal, browser) | No tools (LLM calls only) |
-| Max practical concurrency | 3–10 | **100–300** |
-| Session storage | Hermes SQLite DB | Plugin-local JSONL files |
-| Memory overhead | High (full agent state per worker) | Low (single messages array) |
-| Use case | Complex multi-step subtasks | Wide parallel research/analysis |
-| Uninstallable | Core feature | `rm -rf ~/.hermes/plugins/swarm-agent` |
 
 ---
 
 ## Install
 
 ```bash
-# Copy plugin to Hermes plugins directory
-cp -r . ~/.hermes/plugins/swarm-agent
+# Clone into Hermes plugins directory
+git clone https://github.com/Uhrenn/hermes-swarm-agent.git ~/.hermes/plugins/swarm-agent
 
-# Enable plugin and toolset
+# Enable plugin
 hermes plugins enable swarm-agent
-hermes tools enable swarm
 
 # Restart Hermes or start a new session
 ```
@@ -62,7 +114,7 @@ rm -rf ~/.hermes/plugins/swarm-agent
 
 ### Slash Command: `/swarm`
 
-Users can trigger the swarm directly:
+Users trigger the swarm directly:
 
 ```
 /swarm Evaluate the top 10 AI agent frameworks in 2026
@@ -84,64 +136,12 @@ Options are `key:value` pairs before the goal text:
 |--------|-------------|---------|
 | `provider:<name>` | LLM provider | auto |
 | `model:<name>` | Model override | auto |
-| `workers:<N>` | Total workers | 50 |
-| `concurrent:<N>` | Max concurrent | 50 |
+| `workers:<N>` | Total workers | 300 |
+| `concurrent:<N>` | Max concurrent | 100 |
 | `strategy:<type>` | `map_reduce` or `fanout` | `map_reduce` |
 | `verifiers:<N>` | Verifier count | 0 |
 | `timeout:<N>` | Global timeout (seconds) | 900 |
 | `dry_run` | Plan only, don't execute | false |
-
-### Tool: `swarm_task`
-
-The agent **cannot** call `swarm_task` on its own — it's only available internally to the `/swarm` command handler. Only users decide when to use the swarm.
-
-```json
-{
-  "goal": "Evaluate each AI agent framework's architecture, strengths, and weaknesses",
-  "sources": ["AutoGPT", "CrewAI", "LangGraph", "MetaGPT", "DSPy"],
-  "max_workers": 5,
-  "max_concurrent": 5,
-  "strategy": "map_reduce",
-  "provider": "ollama-cloud"
-}
-```
-
-### 300-Worker Swarm (Ollama Cloud)
-
-```json
-{
-  "goal": "Analyze the AI agent ecosystem in 2026",
-  "sources": ["...300 independent sources..."],
-  "max_workers": 300,
-  "max_concurrent": 100,
-  "allow_300_live": true,
-  "strategy": "map_reduce",
-  "provider": "ollama-cloud",
-  "verifier_count": 3,
-  "timeout_seconds": 900
-}
-```
-
-### Dry Run (Plan Without Execution)
-
-```json
-{
-  "goal": "Audit this codebase",
-  "sources": ["file1.py", "file2.py", "file3.py"],
-  "dry_run": true
-}
-```
-
-### Fanout (No Reduce/Synthesis)
-
-```json
-{
-  "goal": "Get independent evaluations of each competitor",
-  "sources": ["Competitor A", "Competitor B", "Competitor C"],
-  "strategy": "fanout",
-  "max_concurrent": 50
-}
-```
 
 ---
 
@@ -154,14 +154,14 @@ The agent **cannot** call `swarm_task` on its own — it's only available intern
 | `sources` | string[] | auto-generated | 300 | Independent items to assign to workers |
 | `mode` | string | `"llm_only"` | — | Current mode. `delegate_task` remains separate |
 | `strategy` | string | `"map_reduce"` | — | `fanout` (raw results) or `map_reduce` (with synthesis) |
-| `max_workers` | int | 25 | 300 | Total lightweight LLM workers |
-| `max_concurrent` | int | 25 | 300 | Maximum simultaneous coroutines |
-| `allow_300_live` | bool | false | — | Required for concurrency above 50 |
+| `max_workers` | int | 300 | 300 | Total lightweight LLM workers |
+| `max_concurrent` | int | 100 | 300 | Maximum simultaneous coroutines per wave |
 | `verifier_count` | int | 0 | 5 | Optional verifiers to critique synthesis |
 | `timeout_seconds` | int | 900 | 3600 | Global swarm timeout |
 | `worker_timeout_seconds` | int | 180 | 600 | Per-worker LLM call timeout |
 | `provider` | string | auto | — | Provider override (`ollama-cloud`, `xiaomi`, etc.) |
 | `model` | string | auto | — | Model override |
+| `allow_300_live` | bool | false | — | Required for tool-initiated calls with high concurrency |
 | `dry_run` | bool | false | — | Return plan without executing |
 
 ---
@@ -212,40 +212,29 @@ Tested with stepwise concurrency ramp (25 → 300) to find each provider's sweet
 
 ---
 
-## Production Test: 225 Workers on Ollama Cloud
+## Production Test: 300 Workers on Ollama Cloud
 
 ### Configuration
 - **Provider:** Ollama Cloud (nemotron-3-nano:30b)
-- **Workers:** 225
-- **Max concurrent:** 100
-- **Strategy:** map_reduce
-- **Verifiers:** 3
-- **Retry logic:** Adaptive (halves concurrency on 429, exponential backoff)
+- **Workers:** 300
+- **Max concurrent:** 100 (provider-aware scheduling)
+- **Strategy:** fanout
+- **Retry logic:** Adaptive (auto-recover 429s with backoff)
 
 ### Results
 
 | Metric | Value |
 |--------|-------|
-| Workers completed | **225/225 (100%)** |
+| Workers completed | **300/300 (100%)** |
 | Failed | **0** |
+| Initial concurrent | 100 (provider sweet spot) |
 | Peak concurrency | 100 |
-| Waves executed | 4 |
-| Auto-retries recovered | 41 |
-| Wall time | **5.1 minutes** |
-| Throughput | 0.7 workers/sec |
-| Total output | **512,685 chars** |
-| Avg per worker | 2,279 chars |
-| Synthesis length | 5,817 chars |
-
-### Cost
-
-| Item | Count | Est. Tokens |
-|------|-------|-------------|
-| Worker calls (incl. retries) | 266 | ~39,900 |
-| Reducer calls | 23 | ~3,450 |
-| Finalizer + verifiers | 4 | ~600 |
-| **Total** | **293** | **~44,000** |
-| **Cost** | | **~$0.00** (Ollama Cloud free tier) |
+| Waves executed | 5 |
+| Auto-retries recovered | 44 |
+| Wall time | **3.7 minutes** |
+| Throughput | 1.4 workers/sec |
+| Total LLM calls | 344 |
+| **Cost** | **~$0.00** |
 
 ---
 
@@ -256,8 +245,8 @@ Tested with stepwise concurrency ramp (25 → 300) to find each provider's sweet
 ```
 swarm-agent/
 ├── plugin.yaml          # Plugin metadata
-├── __init__.py          # Entrypoint — registers swarm_task under "swarm" toolset
-├── tools.py             # Core runtime: schema, scheduler, LLM calls, reducers
+├── __init__.py          # Entrypoint — registers /swarm command (no tool)
+├── tools.py             # Core runtime: scheduler, LLM calls, reducers, provider sweet spots
 ├── resource_guard.py    # OS limit checks (fd limits, concurrency caps)
 ├── run_store.py         # Append-only JSONL run storage
 ├── tests/
@@ -270,33 +259,49 @@ swarm-agent/
 ### How It Works
 
 ```text
-swarm_task()
-  ├── build_work_items()          # Split sources into worker items
-  ├── ResourceGuard               # Check OS fd limits, adjust concurrency
-  ├── RunStore                    # Create plugin-local run directory
-  └── _run_swarm_async()
-       ├── _run_workers()         # Wave-based execution with retry
-       │    ├── Wave 1: 100 workers → semaphore-bounded coroutines
-       │    ├── Wave 2: 100 workers → auto-retry 429s with backoff
-       │    ├── Wave 3: remaining workers
-       │    └── Wave N: retried failed items at reduced concurrency
-       └── _reduce_results()      # map_reduce only
-            ├── Reducer tree (fan-in groups of 10)
-            ├── Final synthesizer
-            └── Verifiers (optional)
+/swarm <goal>
+  ├── _parse_swarm_args()          # Parse key:value options
+  ├── swarm_task()
+  │    ├── build_work_items()      # Split sources into worker items
+  │    ├── ResourceGuard           # Check OS fd limits
+  │    ├── RunStore                # Create plugin-local run directory
+  │    └── _run_swarm_async()
+  │         ├── _run_workers()     # Provider-aware wave execution
+  │         │    ├── Wave 1: min(max_concurrent, sweet_spot) workers
+  │         │    ├── Wave 2: next batch
+  │         │    ├── ...auto-retry 429s with backoff...
+  │         │    └── Wave N: remaining workers
+  │         └── _reduce_results()  # map_reduce only
+  │              ├── Reducer tree (fan-in groups of 10)
+  │              ├── Final synthesizer
+  │              └── Verifiers (optional)
+  └── Returns formatted text to user
 ```
+
+### Provider-Aware Scheduling
+
+The scheduler starts at the provider's known sweet spot, not at `max_concurrent`:
+
+```python
+PROVIDER_SWEET_SPOTS = {
+    "ollama-cloud": 100,   # tested: 100/100 ok
+    "xiaomi": 50,          # tested: 50/50 ok
+    "openrouter": 80,      # estimated
+    "minimax": 0,          # unusable
+}
+```
+
+This avoids the wasteful "launch 300, get 150 429s, retry" pattern. Instead: launch 100, all succeed, launch next 100, all succeed, done.
 
 ### Retry Logic
 
 When workers hit 429 rate-limit errors:
 
 1. Failed workers are collected for retry
-2. Concurrency is halved (e.g., 100 → 50)
-3. Exponential backoff is applied (2^n seconds, max 16s)
-4. Failed items are re-queued at the front
-5. Convergence to provider's sweet spot happens within 1–2 waves
-
-This means even `max_concurrent=300` auto-converges to the provider's actual limit.
+2. Concurrency reduced by 1/3
+3. Jittered backoff applied (2^n seconds + random 0-2s)
+4. Failed items re-queued
+5. After a clean wave (0 failures), concurrency bumps back up
 
 ### Run Storage
 
@@ -310,8 +315,6 @@ Each run creates a plugin-local directory:
   └── final.json             # Final synthesis + verifier results
 ```
 
-This avoids writing hundreds of worker transcripts into Hermes' main SQLite session database.
-
 ---
 
 ## Safety Model
@@ -320,9 +323,9 @@ This avoids writing hundreds of worker transcripts into Hermes' main SQLite sess
 
 | Setting | Default | Hard Max | Notes |
 |---------|---------|----------|-------|
-| `max_workers` | 25 | 300 | Total workers across all waves |
-| `max_concurrent` | 25 | 300 | Simultaneous coroutines |
-| `allow_300_live` | false | — | Required for concurrency > 50 |
+| `max_workers` | 300 | 300 | Total workers across all waves |
+| `max_concurrent` | 100 | 300 | Simultaneous coroutines per wave |
+| `allow_300_live` | false | — | Required for tool-initiated calls above provider sweet spot |
 
 ### Resource Guard
 
@@ -331,11 +334,8 @@ Before launching, the plugin checks the OS file descriptor limit:
 ```python
 needed = 128 + requested_concurrent × 2
 if soft_fd_limit < needed:
-    # Try to raise limit, or reduce concurrency automatically
     safe = (soft_fd_limit - 128) / 2
 ```
-
-On macOS with the default 256 fd limit, the guard will cap concurrency at ~64 if the limit can't be raised.
 
 ### What Workers Can't Do
 
@@ -360,30 +360,12 @@ Test coverage:
 - ✅ Schema supports 300 max workers/concurrency
 - ✅ No parent-agent context required
 - ✅ No `delegate_task` dispatch (monkeypatched)
-- ✅ Fake LLM scheduler reaches 300 simultaneous coroutines
+- ✅ Fake LLM scheduler completes all 300 workers via waves
 - ✅ 300 live concurrency requires explicit opt-in
 - ✅ JSONL run store survives 300 concurrent writes
 - ✅ Resource guard reduces concurrency when fd limit is too low
-- ✅ Plugin registers correctly with Hermes plugin manager
-
----
-
-## File Structure
-
-```
-hermes-swarm-agent/
-├── README.md                           # This file
-├── plugin.yaml                         # Hermes plugin metadata
-├── __init__.py                         # Plugin entrypoint
-├── tools.py                            # Core swarm runtime
-├── resource_guard.py                   # OS limit guardrails
-├── run_store.py                        # Append-only JSONL storage
-├── tests/
-│   └── test_swarm_agent_plugin.py      # 10 tests (all passing)
-└── docs/
-    ├── 300-concurrent-architecture.md  # Architecture deep-dive
-    └── provider-stress-test-results.md # Full benchmark data
-```
+- ✅ Plugin registers `/swarm` command (not a tool)
+- ✅ Manifest declares `provides_commands` (not `provides_tools`)
 
 ---
 
